@@ -1,0 +1,21 @@
+{
+  "name": "dev-workflow-marketplace",
+  "description": "自律開発ワークフロープラグイン",
+  "owner": {
+    "name": "masatoImayama",
+    "email": "mimayama512@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "dev-workflow",
+      "description": "3エージェント自律開発ワークフロー。仕様ヒアリング→仕様書・計画書→GitHub issue→自律実装。",
+      "author": {
+        "name": "masatoImayama"
+      },
+      "source": {
+        "source": "directory",
+        "path": "plugins/dev-workflow"
+      }
+    }
+  ]
+}
