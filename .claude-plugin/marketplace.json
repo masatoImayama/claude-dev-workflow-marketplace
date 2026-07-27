@@ -17,7 +17,7 @@
         "url": "https://github.com/masatoImayama/claude-dev-workflow-marketplace.git",
         "path": "plugins/dev-workflow",
         "ref": "master",
-        "sha": "629e73175390c9500d346388985345e451110aba"
+        "sha": "6bb141917090f002e140652ae2a75a48d9b4ca05"
       }
     }
   ]
