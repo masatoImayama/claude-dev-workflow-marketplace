@@ -74,6 +74,16 @@ commit/push・PR 作成・クリーンアップ）は、この `$EPIC_WT`（= `.
 **作業ディレクトリ**として実行すること（`cd "$EPIC_WT"` してから、または `git -C "$EPIC_WT"` で操作）。
 **メインリポのチェックアウトを epic ブランチに切り替えてはならない**（兄弟 worktree も作らない）。
 
+### 自律実行の開始を記録
+
+Slack通知が「完全な完了」と「途中停止」を区別できるよう、ループ開始前にマーカーを置く:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/notify-slack.sh" run-start "Epic #$ARGUMENTS"
+```
+
+worktree内から実行してもマーカーはメインリポのルートに置かれるため、実行場所は問わない。
+
 ### Docker sandbox の準備
 
 **まず作業 worktree に移動してから**、実装・テスト用のDockerコンテナを起動する（以降 `pwd` は
@@ -261,6 +271,19 @@ BODY
 ```
 
 **注意: Epic issueはクローズしない。PRがマージされた時点で人間がクローズする。**
+
+### 完了通知（PR作成後）
+
+PRのURLが取れた時点が「完全な完了」。ここでのみ完了通知を出す:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/notify-slack.sh" run-complete \
+  "全[N]タスク完了（スキップ[M]件）
+PR: [PRのURL]"
+```
+
+**この行に到達せずrunが終了した場合、Stopフックが自動的に「自律実行が停止」として通知する。**
+そのため、エラーで中断する場合も含め、成功時以外にこのコマンドを実行してはならない。
 
 ## worktree クリーンアップ
 
