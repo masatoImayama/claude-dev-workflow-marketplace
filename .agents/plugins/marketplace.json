@@ -1,0 +1,23 @@
+{
+  "name": "dev-workflow-marketplace",
+  "interface": {
+    "displayName": "Dev Workflow"
+  },
+  "plugins": [
+    {
+      "name": "dev-workflow",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/masatoImayama/claude-dev-workflow-marketplace.git",
+        "path": "./plugins/dev-workflow",
+        "ref": "master",
+        "sha": "PLACEHOLDER"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
