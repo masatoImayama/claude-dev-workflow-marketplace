@@ -18,7 +18,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "*",
+        "matcher": "Bash|Write|Edit|MultiEdit|Task|NotebookEdit",
         "hooks": [
           {
             "type": "command",
@@ -36,11 +36,17 @@
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh\"",
             "statusMessage": "dev-workflow: 可読性チェック中..."
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/edit-check.sh\"",
+            "timeout": 15,
+            "statusMessage": "dev-workflow: 編集時チェック中..."
           }
         ]
       },
       {
-        "matcher": "*",
+        "matcher": "Bash|Write|Edit|MultiEdit|Task|NotebookEdit",
         "hooks": [
           {
             "type": "command",

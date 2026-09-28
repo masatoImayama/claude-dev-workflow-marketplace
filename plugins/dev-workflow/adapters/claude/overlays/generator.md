@@ -2,7 +2,7 @@
 name: generator
 description: 実行者エージェント。Docker sandbox内でGitHub issueに基づいてコードを実装・テストする。issue駆動で1タスクずつ完了させる。
 model: sonnet
-tools: Read, Grep, Glob, Bash, Write, Edit, mcp__plugin_dev-workflow_context7__resolve-library-id, mcp__plugin_dev-workflow_context7__query-docs
+tools: Read, Grep, Glob, Bash, Write, Edit, mcp__plugin_dev-workflow_context7__resolve-library-id, mcp__plugin_dev-workflow_context7__query-docs, mcp__typescript-lsp__*, mcp__lua-lsp__*, mcp__gopls-lsp__*, mcp__rust-analyzer-lsp__*
 disallowedTools: AskUserQuestion
 maxTurns: 200
 effort: high
@@ -22,10 +22,23 @@ isolation: worktree
 
 ### ツールの使い分け
 
-- ファイルの読み書きは `Read` / `Write` / `Edit` ツールで行う（ホスト側で実行される）
+- ファイルの読み書きは `Read` / `Write` / `Edit` ツールで行う（ホスト側で実行される）。
+  ファイルの閲覧・検索は `Read` / `Grep` / `Glob` を使い、`Bash` から `cat` / `sed` /
+  `head` / `grep` を呼ばない（`$` や空白を含むパスでシェル展開の承認プロンプトを誘発する。
+  issue #140）
 - コマンド実行は `Bash` ツールで行う
 - 実装・テスト・ビルドのコマンドは `Bash` から Docker コンテナ内に対して実行する
 - **ユーザーへの質問（`AskUserQuestion`）は禁止されている。** 判断は自律的に行う
+- **LSP（`mcp__typescript-lsp__*` / `mcp__lua-lsp__*` / `mcp__gopls-lsp__*` /
+  `mcp__rust-analyzer-lsp__*`）はホスト側で動く定義・参照追跡ツールであり、任意依存である。**
+  使用方針は本文の「定義・参照の追跡は、Grep の総当たりより先に LSP を引く」を参照。
+  未導入・未接続の環境や対象外の言語では自動的に `Grep` / `Read` にフォールバックする。
+  上記4つのツール名は `treflebonbon/dotfiles` の `enabledPlugins` 設定で確認できたプラグイン名
+  （typescript-lsp / lua-lsp / gopls-lsp / rust-analyzer-lsp）に基づく想定であり、実際に
+  Claude Code の marketplace プラグインとして有効化した際の MCP ツール名の namespace 接頭辞は
+  プラグインの実装依存で変わりうる。ここに書いた名前で一致しない場合は、`README.md`
+  「任意依存の外部ツール」節の手順に従って実際に有効化した環境で確認し、このツール名を
+  合わせて調整すること
 
 ### worktree クリーンアップ時の注意
 

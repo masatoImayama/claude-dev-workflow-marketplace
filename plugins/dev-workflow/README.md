@@ -70,18 +70,44 @@ claude --plugin-dir /path/to/dev-workflow
 
 ## 任意依存の外部ツール
 
-dev-workflow は2つの外部 MCP ツール（context7 / code-review-graph）を**任意依存**として利用します。
+dev-workflow は複数の外部ツール（context7 / code-review-graph / LSP）を**任意依存**として利用します。
 **必須依存ではありません。入れなくても dev-workflow は従来どおり動作します。**
 
 | ツール | 結線先 | 未導入時の挙動 |
 |---|---|---|
 | [context7](https://github.com/upstash/context7)（MIT） | generator のみ | generator はライブラリ API を context7 で確認しません。推測に頼らず、既存利用箇所・公式ドキュメントで確認する従来どおりの手順になります |
 | [code-review-graph](https://github.com/tirth8205/code-review-graph)（MIT） | evaluator のみ（大規模差分のみ） | evaluator は blast radius（影響範囲）を使った優先順位付けをしません。従来どおり Phase 単位に分割してレビューする手順になります |
+| LSP（typescript-lsp / lua-lsp / gopls-lsp / rust-analyzer-lsp 等） | generator のみ（Claude Code のみ。下記参照） | generator は定義・参照の追跡を `Grep` の総当たり＋`Read` で行います（従来どおり） |
 
 **いずれもワークフローを止めません。** テスト・レビューはツールの有無に関わらず従来どおり完走します。
 
 - **入れ方**: 導入手順・結線方式の実測結果・MCPツール名は [`docs/optional-mcp-tools.md`](docs/optional-mcp-tools.md) が正本です（README では二重管理しません）
 - **効かなければ外す判断基準**: `docs/optional-mcp-tools.md` の「外す判断基準」節を参照してください。複数 Epic を通してトークン消費が減らず、レビュー品質の向上も観測できない場合は結線を外してかまいません
+
+### LSP（探索ターン数の削減。Claude Code のみ。issue #154）
+
+`Grep` → `Read` → `Read` → `Read` と3〜5ターンかかっていた定義・参照の追跡を、LSP
+（go-to-definition・find-references・hover 等）が使えるときは1〜2ターンに縮められます。
+**LSP はホスト側で動く探索ツールであり、generator のビルド・テストが行われる Docker sandbox
+（`sandbox-exec.sh` 経由のコンテナ）とは別物です。** ビルド・テストの代わりにはなりません。
+
+**有効化方法（実際に確認できた方法）**: `treflebonbon/dotfiles` の
+`private_dot_claude/settings.json.tmpl` が、`enabledPlugins` で typescript-lsp / lua-lsp /
+gopls-lsp / rust-analyzer-lsp を常時有効にしている例を確認しています。ユーザースコープの
+`~/.claude/settings.json` に対象言語の LSP プラグインを `enabledPlugins` で有効化すると、
+generator の frontmatter（`adapters/claude/overlays/generator.md` の `tools:`）に列挙済みの
+`mcp__typescript-lsp__*` 等のツールが使えるようになります。
+
+**未確認の注意点**: 有効化した LSP プラグインが実際に公開する MCP ツール名の namespace
+接頭辞は、プラグインの実装依存で変わりえます。`tools:` に書いた名前と一致しない場合は、
+有効化した環境で実際のツール名を確認し、`adapters/claude/overlays/generator.md` を修正して
+`bash adapters/claude/build.sh` で再生成してください。
+
+**Codex には同等の機能がありません。** Codex には Claude Code の marketplace プラグイン /
+`enabledPlugins` に相当する、ユーザーが任意に有効化できる LSP プラグインの仕組みが
+確認できていないため、`adapters/codex/overlays/generator.toml` は LSP の MCP サーバーを
+宣言していません（詳細は同ファイルのコメント参照）。Codex 版の generator は常に
+`Grep` / `Read` で探索します。
 
 ## Docker sandbox のセットアップ
 
@@ -163,19 +189,53 @@ services:
 /dev-workflow:epic notifications
 ```
 
+### フィードバック
+
+```
+/dev-workflow:feedback
+```
+→ 実行ログを分析し、プロジェクト固有の改善は承認を得て反映、ハーネス起因の指摘は
+dev-workflow へ還流する（詳細は「[フィードバックループ](#フィードバックループ)」）
+
 ## 3エージェント
 
 | エージェント | 役割 | モデル | 特徴 |
 |---|---|---|---|
 | **planner** (紫) | 仕様ヒアリング・計画・issue管理 | Opus | 書き込み可 |
 | **generator** (青) | Docker sandbox内でコード実装・テスト | Sonnet | worktree隔離 + Docker |
-| **evaluator** (緑) | Epic完了時に全差分を一括レビュー | Opus | 読み取り専用 + Docker |
+| **evaluator** (緑) | Epic完了時に全差分を一括レビュー | Sonnet（発見役・既定） / Opus（確度判定役・起動時上書き） | 読み取り専用 + Docker |
 
 generator は実装コードに手を付ける前に、`DietrichGebert/ponytail`（MIT）に由来する7段の判断ラダー
 （存在する必要があるか → コードベースに既にあるか → 標準ライブラリ → プラットフォーム標準機能 →
 導入済みの依存 → 1行で書けるか → 最小限の実装）で「作るべきか・再利用すべきか」を判定します。
 **テスト・回帰確認・検証・セキュリティは削減対象外**で、ラダーは実装コードにのみ適用され、
 これらを省く理由には使われません。
+
+## プロンプトの progressive disclosure 方針
+
+各エージェントのシステムプロンプトは、レーン起動のたびに丸ごと読み込まれる。常時読み込む本体を
+薄くし、条件付き・詳細な情報は参照ファイルへ退避する（progressive disclosure）ことで、
+**レーン起動ごとの入力トークンと cold start を削減する。**
+
+**何を本体に残し、何を参照ファイルへ置くか**の判断基準:
+
+| 本体に残す（常時読み込み） | 参照ファイルへ退避してよい |
+|---|---|
+| 安全ルール・可読性原則・禁止事項 | 個別機能の詳細な手順・書式・背景説明 |
+| ブランチ戦略・依存宣言・ウェーブの要点 | 失敗時・例外時にだけ必要な手順 |
+| 停止させるもの／記録して進めるものの分類 | 過去の設計判断の長い理由づけ |
+
+**`skills/*/references/` と `core/references/` の使い分け**:
+
+- `skills/run/references/*.md` — `skills/run/SKILL.md`（run スキル本体）専用の参照。
+  run の実行手順に固有の詳細（サンドボックス起動・進捗表示・リカバリ手順等）を置く
+- `core/references/*.md` — `core/instructions.md`（planner / generator / evaluator
+  3エージェント共通のハーネスルール）専用の参照。個別ロール横断で使う詳細
+  （watchdogの詳細・Epic本文の任意節の詳細・ハーネス非注入原則の対応表等）を置く
+
+退避先には**必ず「いつ読むか」を1行で書く**（例:「ハングを調査するときにだけ読む」）。
+退避元には本文をインライン展開する `<!-- include: -->` を使わず、参照先へのポインタ行だけを
+残す（インライン展開すると本文が再び膨らみ、薄くする目的に反するため）。
 
 ## ワークフロー
 
@@ -214,14 +274,43 @@ generator は実装コードに手を付ける前に、`DietrichGebert/ponytail`
 
 | | 旧（タスクごと） | 現（Epic一括） |
 |---|---|---|
-| evaluator起動回数 | タスク数 × 差し戻し回数 | **1〜3回（タスク数に非依存）** |
+| evaluator起動回数 | タスク数 × 差し戻し回数 | **最大2巡（初回R1の観点別4本並列 + 確度判定1本 + delta-review 1本。タスク数に非依存）** |
 | タスクごとの品質担保 | Opusレビュー | テスト・ビルド・可読性ガード（機械的・LLM不要） |
-| 指摘の扱い | その場で差し戻し | **issue化してgeneratorが対応** |
+| 指摘の扱い | その場で差し戻し | **issue化し、通常のウェーブループで並列に対応** |
 | 打ち切り | 3回REQUEST_CHANGESでスキップ | 2巡で打ち切り、残りは人間のPRレビューへ |
 
 副次的な効果として、レビュアーが**タスクをまたいだ整合性**（重複実装、
 タスク間で食い違う命名やデータ構造、仕様の実装漏れ）を見られるようになる。
 タスク単位のレビューでは原理的に見えなかった観点。
+
+### 観点別レビュー（focus）とウェーブ差分の先行レビュー（wave-review）
+
+evaluator は観点（`correctness` / `readability` / `over-engineering` / `security`）を指定して
+起動できる。観点を指定すると、evaluator は**自分の観点の指摘だけ**を返す（観点未指定なら
+従来どおり全観点を見る。Codex は観点未指定のまま使う）。Epic末の一括レビュー（R1）は
+**この4観点を `@evaluator` の同一メッセージで並列起動**し、run が結果を
+マージ・重複排除する（同一 `location` の統合、最も高い severity の採用、verdict の合成、
+`reviewed_commit` 食い違い時は最も古いものを採用。手順の詳細は
+`skills/run/references/review.md`「R1の結果マージ」参照）。
+
+R1（発見役）の既定モデルは **sonnet**。マージ後、issue化（R2）の前に**確度判定役
+（`model: opus` を起動時に上書きした evaluator を1本）**が `findings` を再検証し、
+確度（`high-confidence` / `low-confidence`）を付与する。`low-confidence` の指摘は破棄せず
+「レビューで挙がった軽微な指摘」へ格下げして記録する（詳細は
+`skills/run/references/review.md`「確度判定」・`docs/adr/0006-evaluator-model-split.md`参照）。
+wave-review / delta-reviewはこの確度判定を経由しない。Codex側は同等のモデル切り替え機構の
+有無を確認できていないため、従来どおり単一evaluatorのまま据え置いている。
+
+またモードに `wave-review`（`[前回レビュー済みcommit]..[epic-branch]`）を追加し、あるウェーブが
+Epic ブランチへ取り込まれた直後にそのウェーブ差分だけを先行レビューできるようにした。
+**呼び出しは Step 3（レーン起動と同一メッセージ）で行う**: 直前のウェーブが Epic ブランチへ
+取り込まれた直後の差分（`REVIEWED_COMMIT..WAVE_BASE`）を、次ウェーブのレーン実装と並行して
+evaluator に先行レビューさせる（最初のウェーブでは起動しない）。指摘はその場で直させず、
+high/medium は `review` issue として蓄積し、実際の修正は Epic 末の指摘対応ループでまとめて行う。
+最終ウェーブの差分と仕様書との照合・タスク間の重複実装といった**全ウェーブ横断の整合**は
+wave-review の対象外であり、Epic 末の一括レビューが引き続き見る（設計判断は
+`docs/adr/0003-parallel-review-by-focus.md`、起動条件と `REVIEWED_COMMIT` の更新規則の詳細は
+`skills/run/references/wave-review.md` を参照）。
 
 ## ブランチ戦略
 
@@ -260,6 +349,24 @@ bash scripts/cleanup-lane-worktrees.sh --epic-branch <ブランチ> \
 
 `/dev-workflow:run` は Task issue が宣言した依存関係だけを根拠に、依存の無いタスクを**ウェーブ単位で並列実行**する。1タスクずつ直列に流していた従来方式に対し、独立したタスクの待ち時間を短縮する。
 
+### Epic #143 が持つ2つの軸
+
+run の実行時間短縮を狙った Epic #143 の変更は、性質の異なる**2つの軸**にまたがる。以降の節を
+読むときは、どちらの軸に属する変更かを意識すると全体像がつかみやすい。
+
+1. **直列区間とプロンプト量の削減**（run の実行時間そのものを縮める）: ウェーブ末の取り込み検証と
+   Epic 統合ゲートへの三段構成化（下記「機械的ゲートの三段構成」）、サンドボックス呼び出し
+   オーバーヘッドの削減（`docs/adr/0002-sandbox-overhead-reduction.md`）、レビューの並列化と
+   ウェーブ間オーバーラップ（`docs/adr/0003-parallel-review-by-focus.md`）、progressive
+   disclosure によるプロンプト量削減（下記「プロンプトの progressive disclosure 方針」）が該当する
+2. **推論ターン数と出力トークン量の削減**（generator・evaluator 1回あたりの呼び出しコストを
+   縮める）: レーン内の連続処理による cold start 排除（下記「レーン内の連続処理」）、
+   編集時チェックフックによる Docker 往復削減（`docs/adr/0005-edit-time-check-hook.md`）、
+   完了報告の証跡ファイル化（下記「完了報告の形式」）、evaluator のモデル構成の分離
+   （上記「3エージェント」表・`docs/adr/0006-evaluator-model-split.md`）が該当する。
+   レーンのウェーブ横断維持（cross-wave lane reuse）はこの軸に属するが、本 Epic では
+   実装を見送っている（`docs/adr/0004-cross-wave-lane-reuse.md`）
+
 ### 依存宣言（`- 前提:`）の書き方
 
 planner は各 Task issue に次のいずれかを必ず書く。
@@ -281,30 +388,91 @@ Phase は人間向けの区分として残るが、**実行順序の決定には
 
 - 既定は **3**。`/dev-workflow:run #123 --lanes N` で上書きできる。指定が無ければ環境変数 `DEV_WORKFLOW_MAX_LANES` を使い、それも無ければ既定の3を使う
 - **ホスト性能からの自動算出はしない。** ボトルネックは（コンパイルではなく）バインドマウントの I/O であり、ホストのコア数と相関しないため
-- ウェーブ内のタスク数が `lanes` を超える場合は issue 番号の小さい順に `lanes` 件ずつのサブバッチに分割する。統合ゲートはサブバッチごとではなく**ウェーブに1回**
+- ウェーブ内のタスク数が `lanes` を超える場合、**サブバッチに分けて順番に流すのではなく、`lanes` 本のレーンへタスク列として配分する**（レーン L には `plan-waves.sh` の `subbatch` 列の L 番目のタスクが順に入る）。各レーンは割り当てられたタスク列を**同一の作業ツリーで連続処理**する。ウェーブ末の取り込み検証（merge-base検証＋可読性ガード）は**ウェーブに1回**。プロジェクトの全テストはEpicにつき1回のEpic統合ゲートに集約する（#144）
+
+### レーン内の連続処理（cold start の排除）
+
+**generator はタスクごとに作り直さない。** 1レーンが複数タスクを持つ場合、同じ worktree・同じコンテキストのまま次のタスクへ進む。
+
+- ベース合わせ（`git merge --ff-only <WAVE_BASE>`）・プロジェクト固有の準備コマンド・共有ディレクトリのセットアップは、**レーンの先頭で1回だけ**行う
+- 2件目以降のタスクは、1件目で得たリポジトリの理解（ディレクトリ構成・テストコマンド・規約）をそのまま使い、調べ直さない
+- タスク1件につき独立したコミットを積む。run はタスク単位で issue をクローズする
+- **1件のタスクに失敗しても、レーン全体を投げ出さない。** 失敗したタスクは `git restore --source=HEAD --staged --worktree -- :/` で追跡ファイルをHEADの状態へ戻し、`git status --short --untracked-files=all -- :/`（削除はしない）で残る未追跡ファイルを報告してから見送り、次のタスクへ進む（`git reset --hard` / `git clean` はベース合わせと同じ理由で`permissions.deny`にブロックされうるため、ここでも使わない。`git clean`はフラグに関わらずコマンド名の前方一致でブロックされうるため、dry-runの`-nd`を付けても対象になる。`-- :/` は cwd 相対にならず常にリポジトリ全域を対象にするために必須。`--untracked-files=all`（`-uall`）は `status.showUntrackedFiles=no` のようなローカル設定を上書きし、未追跡ファイルが隠れたまま「残留なし」という誤った証跡が残るのを防ぐために必須）
+
+これは Epic #42 の実測（generator 81k〜150k トークン／タスク）のうち、**タスクごとの cold start が占める分**——system prompt の読み直しとリポジトリの再調査——を取り除くための変更である。従来のサブバッチ方式が持っていた「サブバッチごとに全レーンの完了を待つ」バリア同期も同時に消える。
+
+**この連続処理は同一ウェーブ内に限られる。** ウェーブをまたいでレーン（generator）を使い回す
+「cross-wave lane reuse」を Task #153 が検証したが、当時は「generator 自身のツール一覧に
+継続手段が見当たらない」ことを根拠に「Claude Code にはその手段が無い」と誤って結論していた。
+実際には Claude Code に `SendMessage` ツールが実在し、既存サブエージェントをコンテキストを
+保持したまま継続させる機構自体は存在する（`SendMessage` はオーケストレータ側のツールであり、
+generator 自身の道具箱に無かったことは根拠にならなかった。Task #152 で訂正）。ただし
+**本 Epic では `SendMessage` によるレーン継続を実装・実地検証してはいない**ため、
+`ウェーブ数 × レーン数` 回の spawn は変わらず残る（見送りの経緯は
+`docs/adr/0004-cross-wave-lane-reuse.md` 参照）。
+
+### 完了報告の形式（証跡はファイル、報告は1行）
+
+generator・run 双方の**出力トークン量**を削るため（Task #156）、完了報告は「実出力をチャットへ
+貼る」形をやめ、**証跡はファイルに書き出し、チャットには1行の判定だけを書く**形に変えている。
+
+- ベース検証・準備コマンドの実出力は `mktemp` で作った証跡ファイル（`${TMPDIR:-/tmp}/dw-lane-*`。
+  リポジトリ外なのでコミット対象にならない）へ `tee -a` で追記する
+- 完了報告はタスク1件につき**次の5項目を必ず含む1行**にする: タスク番号 / 成功・見送り /
+  SKIP件数 / 所要秒数 / 証跡ファイルのパス（例:
+  `Task #5: success skips=0 duration_sec=480 evidence=/tmp/dw-lane-evidence.abc123 commit=1a2b3c4`）
+- レーンの複数タスク分の1行報告は `scripts/format-lane-result.sh` で整形し、
+  `A=#5(12:03-12:11 8m00s)` のような短い表示にまとめる
+- 実出力そのものをチャットへ貼り直さない。**自己申告にしないという意図は変わらない**
+  （ファイルとして実在し、必要なときに `grep`/`cat` で機械的に検証できる分、チャットに貼るより
+  弱くならない）
+- 詳細な書式・命名規則は `core/roles/generator.md`「完了報告」節を参照
+
+### 機械的ゲートの三段構成
+
+フルスイートを「タスクごと」「ウェーブごと」の両方で走らせない。1レーンが複数タスクを連続処理する以上、レーン内のフルスイートはレーン内で**直列に積み上がる**。同様にウェーブごとのフルスイートも「ウェーブ数 × フルスイート時間」の直列区間になるため、**フルスイートはEpicにつき1回、全ウェーブ完了後に集約する**（#144）。
+
+| 検証点 | 対象ツリー | 実行するもの | 頻度 |
+|---|---|---|---|
+| **レーン内ゲート** | generator の isolation worktree | **変更範囲のテスト**（変更したファイルが属するパッケージ／モジュール単位） | タスクごと |
+| **ウェーブ末の取り込み検証** | wave ブランチ（全レーン取り込み後） | merge-base 完全一致検証＋可読性ガード | ウェーブごとに1回 |
+| **Epic 統合ゲート** | Epic ブランチ | **プロジェクトの全テスト＋可読性ガード** | **Epicにつき1回**（全ウェーブ完了後） |
+
+- **「回帰なし」を宣言できるのはEpic統合ゲートだけ。** generator は完了報告に「変更範囲のテストが通った」とだけ書く
+- 無関係な領域の回帰はEpic統合ゲートが拾う。Epic統合ゲートが落ちた場合は、ウェーブ単位の二分探索で原因ウェーブを特定し、修正タスクとして通常のウェーブループで対応させる（下記「リカバリ」）
+- 変更が共通基盤に及ぶなど広範だと generator が判断した場合に限り、そのタスクで全テストを走らせてよい（判断根拠を報告に残す）
+- **トレードオフ**: 回帰の検知がEpic末まで遅れる。ウェーブ内の自動の安全網はレーン内ゲート・マージ健全性チェック・可読性ガードだけになり、Epicブランチに「フルスイート未通過のコミット」が一時的に載りうる（従来の不変条件「Epicブランチには統合ゲートを通ったコミットだけが載る」は変わる）。main への取り込みは常に人間のPRレビューを通ることが前提（詳細は `docs/adr/0001-integration-gate-at-epic-end.md`）
 
 ### `--lanes 1` は現行と等価なロールバック手段
 
-`--lanes 1` を指定すると「1レーンのウェーブ」として**並列時と同じコードパス**を通り、結果は現行（並列化前）と等価な逐次実行・直線履歴になる。並列用と逐次用でコードパスを分けていないため、障害時は値を変えるだけで安全にロールバックできる。
+`--lanes 1` を指定すると「1レーンのウェーブ」として**並列時と同じコードパス**を通り、逐次実行になる。並列用と逐次用でコードパスを分けていないため、障害時は値を変えるだけで安全にロールバックできる。`lanes=1` は「レーンが1本」という意味であり、「1回に1タスクしか進めない」という意味ではない——そのウェーブの全タスクが1本のレーンで連続処理される。
 
 ### ウェーブと wave ブランチ
 
 ```
 main（保護: 人間のみマージ可）
- └─ epic/epicXX/[機能名]                 ← 統合ゲートを通ったコミットだけが載る
-     └─ wave/epicXX/<ウェーブ番号>        ← レーンを取り込み統合ゲートに掛ける一時ブランチ（originへpushしない）
+ └─ epic/epicXX/[機能名]                 ← ウェーブ取り込み後、Epic統合ゲート（Epicにつき1回）を通過してPR化される
+     └─ wave/epicXX/<ウェーブ番号>        ← レーンを取り込み取り込み検証に掛ける一時ブランチ（originへpushしない）
          └─ 各レーンの作業ブランチ（generatorのisolation worktree由来）
 ```
 
-- **ウェーブ**とは、依存グラフの同一レベルに属し同時に実行できるタスクの集合。統合ゲートの単位でもある
+- **ウェーブ**とは、依存グラフの同一レベルに属し同時に実行できるタスクの集合。ウェーブ末の取り込み検証の単位でもある
 - **WAVE_BASE** は、ウェーブ開始時点の Epic ブランチ tip。**各レーン（generator の isolation
   worktree）の分岐元はハーネスが決めるため WAVE_BASE とは限らない。** isolation worktree を
   作るのはハーネスであり、run はメインリポのチェックアウトを Epic ブランチへ切り替えないため、
   分岐元は通常メインリポのデフォルトブランチのままである。そのため generator は実装着手前に
-  `git reset --hard "$WAVE_BASE"` で自分の HEAD を明示的に合わせる
-  （`core/roles/generator.md`「渡されたベースにHEADを合わせる」参照）
-- レーン（generator の isolation worktree）は wave ブランチへ merge-base 検証つきで取り込まれ、**wave ブランチ上で統合ゲート（プロジェクトの全テスト・可読性ガード）を1回だけ通過してから** Epic ブランチへ `--ff-only` で進む
-- **Epic ブランチには統合ゲートを通ったコミットだけが載る。** 失敗しても Epic ブランチは無傷なので、`git reset --hard` や force push は不要
+  `git merge --ff-only "$WAVE_BASE"` で自分の HEAD を明示的に合わせる。**`git reset --hard` は
+  使わない**（一般的な安全設定でブロックされる代表的なコマンドであり、実際に本Epicのウェーブ2で
+  全レーンがこれにより着手不能になって停止した。`merge --ff-only` は破壊的でなくブロックされ
+  にくいうえ、メインリポのHEADがWAVE_BASEの祖先である限りfast-forwardは成功する。Epicブランチを
+  切った後にデフォルトブランチが進むとこの前提は崩れうるため、generatorはmergeの前に
+  `git merge-base --is-ancestor HEAD "$WAVE_BASE"` で可否を事前判定して証跡に残し、失敗理由が
+  「分岐元のずれ」か「作業ツリーの汚れ」かを停止報告から判別できるようにする）
+  （`core/roles/generator.md`「渡されたベースにHEADを合わせる」参照）。
+  **v0.17.0 以前はここが `git reset --hard` だったため、`permissions.deny` のある環境では
+  ウェーブ2以降で全レーンが着手不能になる。v0.18.0 以降へ更新すること**
+- レーン（generator の isolation worktree）は wave ブランチへ merge-base 検証つきで取り込まれ、**wave ブランチ上でウェーブ末の取り込み検証（merge-base完全一致検証・可読性ガード）を1回だけ通過してから** Epic ブランチへ `--ff-only` で進む。**プロジェクトの全テストはここでは走らせない**（Epicにつき1回のEpic統合ゲートに集約する。#144）
+- **Epic ブランチにはウェーブ末の取り込み検証を通過したコミットが載る。** プロジェクトの全テストはEpic統合ゲート（Epicにつき1回）で検証するため、Epicブランチに「フルスイート未通過のコミット」が一時的に載りうる（従来の不変条件「Epicブランチには統合ゲートを通ったコミットだけが載る」からの変更。トレードオフは上記「機械的ゲートの三段構成」参照）
 - **Epic ブランチへの force push は行わない。wave ブランチは origin へ push しない**（ローカルの一時ブランチ）
 
 ### `--ff-only` から merge-base 検証への変更理由
@@ -325,24 +493,46 @@ git merge --no-edit "$LANE_BRANCH"          # 直線性の強制はやめる（f
 
 ### リカバリ
 
-**共通原則: 失敗したレーンだけを落とし、先に取り込めたレーンの成果は活かす。ウェーブ全体は捨てない。**
+**共通原則: 失敗した「タスク」だけを落とし、先に取り込めた成果は活かす。レーン全体もウェーブ全体も捨てない。**
 
 | 失敗パターン | 扱い |
 |---|---|
-| レーン内ゲート失敗 | wave に取り込まず、試行回数を保持したまま次ウェーブへ持ち越す（ウェーブ内では再試行しない） |
+| レーン内ゲート失敗（タスク単位） | そのタスクだけ見送り、**レーンの残りのタスクは続行する**。試行回数を保持したまま次ウェーブへ持ち越す（ウェーブ内では再試行しない） |
 | merge-base 不一致（`merge-lane.sh` exit 10） | 取り込まず差し戻す。実出力を issue にコメント |
 | マージ競合（`merge-lane.sh` exit 11） | 取り込まず、競合ファイル一覧と相手レーンを issue にコメントし次ウェーブで再実行 |
 | 競合で2回失敗 | 次ウェーブで単独レーン（`lanes=1` 相当）として実行 |
 | 同一タスクで3回失敗 | スキップし、issue にコメントのうえ `--skipped` に加える |
-| 統合ゲート失敗 | WAVE_BASE から wave ブランチを作り直し、レーンを1本ずつ「マージ→ゲート」で積んで原因レーンを一意に特定。特定したレーンだけ差し戻し、残りは活かす |
+| 統合ゲート失敗（ウェーブ末、可読性ガード） | WAVE_BASE から wave ブランチを作り直し、レーンを1本ずつ「マージ→可読性ガード」で積んで原因レーンを一意に特定。特定したレーンだけ差し戻し、残りは活かす |
+| Epic統合ゲート失敗（全ウェーブ完了後、プロジェクトの全テスト） | Epicは既にウェーブを取り込み済みで無傷ではない。ウェーブ単位の二分探索で原因ウェーブを特定し、修正タスクとして起票して通常のウェーブループで対応させる。**再試行は最大2回。** それでも通らなければPR本文冒頭に「Epic統合ゲート不合格」と明記して人間へ渡す（#144） |
 
 「ウェーブ内で再試行しない」のは、バリア同期のためウェーブ内の再試行が完了済みの他レーンを待たせ続けるだけになるため。次ウェーブに回せばベースが進むだけで、「先行タスクの変更が無かったせいで落ちた」類の失敗は自然に解消する。
 
 **スキップの伝播**: スキップされたタスクに依存する後続タスクは実行せずスキップし、その旨を issue にコメントする（推移的に伝播する）。
 
+### ウェーブ差分の先行レビュー（wave-review）
+
+レビューは全タスク完了後にまとめて始めると、実装が終わるまで1秒も進まない完全な直列区間になる。
+`/dev-workflow:run`（Claude Code版）は、あるウェーブが Epic ブランチへ取り込まれた時点で、
+**次ウェーブのレーン起動と同一メッセージ**で evaluator を1本起動し、そのウェーブ差分
+（`REVIEWED_COMMIT..[取り込み後のEpic tip]`）を先行レビューする。Claude Code のサブエージェントは
+バッチ全員が終わるまで結果が返らないため、これが並行実行の唯一の実装手段である
+（バッチの所要時間は `max(最長レーン, レビュー)` になる）。
+
+- 最初のウェーブでは（前ウェーブが無いため）wave-review を起動しない
+- `REVIEWED_COMMIT` の初期値は Epic ブランチの分岐元（`main` との merge-base）。wave-review が
+  `reviewed_commit` を返して完了するたびに進める。**evaluator の起動が失敗した場合は進めない**
+  （取りこぼしは次の wave-review、最終的には Epic 末レビューが拾う）
+- wave-review の指摘はその場で直さない。high/medium は `review` issue として蓄積し、実際の修正は
+  Epic 末の指摘対応ループでまとめて行う（同期点を増やしてオーバーラップの利得を消さないため）
+- 最終ウェーブの差分と、仕様書との照合・タスク間の重複実装といった**全ウェーブ横断の整合**は
+  wave-review の対象外であり、Epic末の一括レビューが引き続き見る
+- 詳細は `skills/run/references/wave-review.md` を参照
+
 ### Codex との差
 
-並列レーンの起動は Claude Code のみ対応する。Codex はサブエージェント専用の worktree を持たないため、**`lanes=1` 固定**で動作する。これは「仕様が違う」のではなく「設定値が固定されているだけ」であり、依存グラフ・merge-base 検証・wave ブランチ経由の統合ゲート・cherry-pick 廃止・スキップの伝播は共通仕様として両方に同じ形で適用される。`lanes=1` のとき「1レーンのウェーブ」として並列時と同じコードパスを通るため、両 run スキルの記述は一致する。
+並列レーンの起動は Claude Code のみ対応する。Codex はサブエージェント専用の worktree を持たないため、**`lanes=1` 固定**で動作する。これは「仕様が違う」のではなく「設定値が固定されているだけ」であり、依存グラフ・merge-base 検証・wave ブランチ経由の統合ゲート・cherry-pick 廃止・スキップの伝播は共通仕様として両方に同じ形で適用される。`lanes=1` のとき「1レーンのウェーブ」として並列時と同じコードパスを通るため、両 run スキルの記述は一致する。**wave-review も同様の理由（`codex exec` を子プロセスとして逐次起動する構造にはバッチ内並行の手段が無い）で Codex 版には実装しない。**
+
+Epic末の一括レビュー（R1）も同じ理由で差がある。Claude は観点別4本の evaluator を同一メッセージで並列起動するが、**Codex はサブエージェント並列起動の手段が無いため、従来どおり単一 evaluator の全観点レビューのままとする**（`adapters/codex/run-loop.sh` と `skills-codex/` は変更していない）。
 
 ### `scripts/plan-waves.sh --print`（ドライラン）
 
@@ -393,6 +583,20 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/merge-lane.sh" \
 
 終了コードは `0`=取り込み成功 `10`=merge-base 不一致（ベース逸脱） `11`=マージ競合（`git merge --abort` 済み） `2`=引数エラー `1`=その他の失敗。exit 10 / 11 のときも作業ツリーは汚さない。
 
+### Epic 本文の任意節（一覧）
+
+Epic issue 本文には、書くかどうかを **planner が判断する4つの任意節**がある。いずれも
+「節が無ければ何もしない（既存 Epic に完全後方互換）」という設計で共通する。詳細はそれぞれ
+直後の節（および `## 準備コマンド` / `## SKIPパターン` / `## 共有ディレクトリ` / `## 編集時チェック`
+の各 H2 節）を参照。
+
+| 節 | 用途 | 適用範囲 |
+|---|---|---|
+| `## 準備コマンド` | タスクに依らず同じ結果になるプロジェクト固有の準備（生成物配置・依存ダウンロード等）をEpic開始時に1回実行する | Epic専用worktree（`--warm`）＋各レーンの作業ディレクトリで初回1回 |
+| `## 共有ディレクトリ` | `## 準備コマンド` の成果（`node_modules`等）を、レーンごとにフル実行せずsymlinkで共有する | 各レーンの作業ディレクトリ（`share-prepared-dirs.sh`） |
+| `## SKIPパターン` | built-in ランナー（go/jest/pytest）と異なる形式のSKIP行を数えるためのERE | `count-skips.sh`（レーン内ゲート・統合ゲートの両方） |
+| `## 編集時チェック` | 編集直後にホスト側で型/lint単体の軽量チェックを走らせる（`<glob> <コマンド>`のマッピング） | `edit-check.sh`（PostToolUseフック） |
+
 ### Epic の `## 準備コマンド` 節
 
 生成物の配置（wasm 等）のような**タスクに依らず同じ結果になる**プロジェクト固有の準備は、タスクごとに generator へ繰り返させず、Epic 開始時に1回だけ実行する。
@@ -412,8 +616,9 @@ Epic issue 本文にこの節があれば、run がその内容を Epic 開始�
 「SKIP されたテストがあれば件数と内容を報告に含めること」という自然言語の依頼は、`tail` で目視して `--- SKIP` が見えなかったことをもって「SKIP 0件」と誤報告する事故を招いた（依存物が未配置だとテストは無言で `SKIP` され `ok` と表示されるため）。レーン内ゲート（generator）・統合ゲート（run）のどちらも、この自己申告ではなく `count-skips.sh` で機械的に数える。
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/count-skips.sh" [--file <テスト出力のログ>] [--pattern <ERE>]
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/count-skips.sh" [--file <テスト出力のログ>] [--pattern <ERE>] [--runner <go|jest|pytest>]
 <テスト出力> | bash "${CLAUDE_PLUGIN_ROOT}/scripts/count-skips.sh"
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/count-skips.sh" --help
 ```
 
 出力（1行1項目・機械可読、この順で必ず3行）:
@@ -424,17 +629,20 @@ runner=<go|pytest|jest|custom|unknown>
 pattern=<実際に使ったERE または none>
 ```
 
-終了コードは `0`=数えられた `1`=数えられなかった（`skips=unknown`。fail loud） `2`=引数エラー。
+終了コードは `0`=数えられた `1`=数えられなかった（`skips=unknown`。fail loud） `2`=引数エラー。`--help` は使い方を表示して `0` で終了する。
 
 判定順序（上から最初に一致したものを使う）:
 
 1. `--pattern` または環境変数 `DEV_WORKFLOW_SKIP_PATTERN` があれば `runner=custom` としてそのEREに一致する行数を数える（最優先）
-2. Go と判定できる（`^--- (PASS|FAIL|SKIP)` または `^(ok|FAIL|PASS)` を含む）→ `^--- SKIP` の一致行数
-3. jest と判定できる（`^Tests:` を含む）→ `Tests:` 行の `<N> skipped` の N
+2. `--runner <go|jest|pytest>` が指定されていれば、自動判定を行わずそのランナーの抽出ロジックを強制する（誤検出時に呼び出し側から矯正する手段。#142）
+3. jest と判定できる（`^Test Suites:` / `^Tests:` / `^Snapshots:` のいずれかを含む）→ `Tests:` 行の `<N> skipped` の N
 4. pytest と判定できる（`test session starts` を含む）→ サマリ行の最後の `<N> skipped` の N
-5. どれにも当てはまらない → `skips=unknown` / `runner=unknown` / exit 1
+5. Go と判定できる（`^--- (PASS|FAIL|SKIP)` または `^(ok|FAIL|PASS)` を含む）→ `^--- SKIP` の一致行数
+6. どれにも当てはまらない → `skips=unknown` / `runner=unknown` / exit 1
 
-built-in ランナー（go/jest/pytest）と異なる出力形式のプロジェクトでは既定で `skips=unknown` になる。この場合に必ず「0件」として扱ってはならない（下記「Epic の `## SKIPパターン` 節」で `DEV_WORKFLOW_SKIP_PATTERN` を設定する）。
+jest はテストファイルごとに `PASS <file>` / `FAIL <file>` という行を出力し、これがGo判定の `^(ok|FAIL|PASS)` と字面衝突する。そのため jest 判定をGo判定より先に行う（#142。以前は逆順だったため、jestのログが `runner=go` に誤判定され、実際にはSKIPがあっても `skips=0`（exit 0）という最も危険な誤りが返っていた）。
+
+built-in ランナー（go/jest/pytest）と異なる出力形式のプロジェクトでは既定で `skips=unknown` になる。この場合に必ず「0件」として扱ってはならない（下記「Epic の `## SKIPパターン` 節」で `DEV_WORKFLOW_SKIP_PATTERN` を設定するか、誤検出であれば `--runner` で矯正する）。
 
 ### Epic の `## SKIPパターン` 節
 
@@ -477,11 +685,74 @@ node_modules  yarn.lock package.json
   が Epic 専用 worktree の成果ディレクトリへの symlink 作成を試みる
 - **節が無ければ何もしない**（共有せず、現行どおり各レーンで準備コマンドをフル実行する。
   既存 Epic に完全後方互換）
-- symlink 作成に失敗した場合（共有元が無い・フィンガープリント不一致等）は、フォールバックとして
-  `## 準備コマンド` 節の内容が実行される
+- symlink 作成に失敗した場合（共有元が無い・フィンガープリント不一致等）、まず実体コピー
+  （`cp -a`。失敗時は `cp -r`）による追加のフォールバックを1回だけ試みる（issue #139。
+  Windows + Docker Desktop のバインドマウント環境でコンテナ内から `ln -s` が失敗する場合が
+  あると報告されている。詳細は `docs/adr/0007-share-prepared-dirs-copy-fallback.md`）。
+  これも失敗すれば、さらなるフォールバックとして `## 準備コマンド` 節の内容が実行される
+- symlink・コピーのいずれも失敗し、かつ `## 準備コマンド` 節も無い（`--run-prep` が渡されない）
+  場合は、レーンが準備成果を一切得られないまま進んでしまう。このとき
+  `share-prepared-dirs.sh` は stderr に明示の `WARNING` を出す（issue #139。終了コードは
+  変わらない）
 - 依存を追加・更新するタスク（`package.json` / lockfile 等を変更するタスク）では、install 系
   コマンドの前に `share-prepared-dirs.sh --detach` で共有リンクを解除してから install する
-  必要がある（generator へは run が指示するが、人間が挙動を追えるようここにも明記する）
+  必要がある（generator へは run が指示するが、人間が挙動を追えるようここにも明記する）。
+  **実体コピーで共有されたエントリは symlink ではなく独立した実体のため、`--detach` の対象
+  外である**（そもそも共有元と inode を共有しておらず、install しても共有元を汚さない）
+- 同一レーン worktree への準備コマンドの多重実行（issue #104 が報告したネイティブバイナリ
+  破損事故の原因）は、`share-prepared-dirs.sh` がレーンの `.git` 配下に作るロック兼完了マーカー
+  （`mkdir` によるアトミックな取得。実行中に2回目が来ると `exit 3`）で防いでいる。generator は
+  `exit 3` を受け取ったら待たず・2本目も起動せずそのまま停止する
+- **レーン専用の `node_modules` を named volume 化する案は実装していない。** 現行の
+  「コンテナは Epic 単位で1個だけ常駐し全レーンが `docker exec` で入る」モデルと構造的に
+  衝突するため据え置いた。理由の詳細は `docs/adr/0008-node-modules-named-volume-deferred.md`
+  を参照
+
+### Epic の `## 編集時チェック` 節
+
+「編集 → `sandbox-exec.sh` でビルド/テスト実行 → エラーを読む → 修正」で最低3ターン、かつ
+毎回 Docker 往復（1呼び出しあたり約3.4秒。「検証結果のスタンプ（呼び出しごとの固定オーバーヘッド
+削減。issue #145）」参照）が発生する。編集直後にホスト側で型チェック単体・lint単体のような
+軽量チェックを走らせ、その場で違反をエージェントへ差し戻すことでこのループを縮めるのが
+`scripts/edit-check.sh`（`PostToolUse(Write|Edit|MultiEdit)` フック）である。詳細な設計判断は
+`docs/adr/0005-edit-time-check-hook.md` を参照。
+
+`## 準備コマンド` / `## SKIPパターン` と同じ機構で、チェック内容をハードコードせず Epic issue
+本文から受け取る。書式は空白区切りで1行に「編集ファイルに一致させる glob」と「実行する
+コマンド（`{file}` が編集ファイルパスに置換される）」を並べる。上から順に最初に一致した行の
+コマンドを使う。
+
+````markdown
+## 編集時チェック
+
+```
+*.go   test -z "$(gofmt -l {file})"
+*.py   ruff check {file}
+*.ts   npx tsc --noEmit -p tsconfig.json
+```
+````
+
+- **非0終了でのみ差し戻すため、違反を終了コードで表現できるコマンドを書くこと**
+  （`gofmt -l` のように違反ファイルを一覧に出すだけで終了コードが常に0のコマンドは、
+  違反があっても永久にブロックしない。`test -z "$(gofmt -l {file})"` のように終了コードへ
+  変換すること。レビュー #165）
+- **節が無ければ何もしない**（既存 Epic の挙動を変えない）
+- 節があれば run が Epic 開始時に `scripts/edit-check.sh --write` でマーカーファイル
+  （`.claude/.dev-workflow-edit-check`。`scripts/lib/marker-root.sh` が解決するメインリポの
+  ルート配下、Epic 専用 worktree・各レーンの isolation worktree のいずれから見ても同じ場所）
+  へ書き出す。節が無ければ `--clear` で前回 Epic の内容を消す
+- **PostToolUse フックは CLI 本体の子プロセスとして起動されるため、generator が Bash ツール
+  越しに `export` した環境変数は届かない。** マーカーファイル経由にしているのはこのためで、
+  generator 側のプロンプトへ追加の埋め込みは不要（フックが編集のたびに自動発火する）
+- **タイムアウトは既定5秒**（`DEV_WORKFLOW_EDIT_CHECK_TIMEOUT` で調整可）。想定するのは
+  型チェック単体・lint単体のような**秒オーダーの処理であり、テストスイートではない**。
+  テストの実行はレーン内ゲート・統合ゲートが別途担う
+- **フック自体のエラー（コマンド不在・タイムアウト）はブロックしない**（`exit 0` で素通り）。
+  ブロックするのは「チェックが実行でき、かつ非0終了＝違反が見つかった場合」だけ
+- **ホスト側で実行する**（`sandbox-exec.sh` 経由にしない）。Docker 往復削減という目的自体と
+  矛盾するため（ADR参照）。ホストにツールチェインが無い場合、その glob 行を書かなければ
+  何もしない（フェイルセーフ）
+- 差し戻し契約は `check-readability.sh` と同一（`DEV_WORKFLOW_HOOK_VENDOR` で出し分け）
 
 ## ハーネス非注入原則
 
@@ -515,6 +786,56 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/check-repo-hygiene.sh" --check  # 書き換�
 ## YOLOモード（完全自律動作）
 
 実装フェーズ（run）ではユーザー確認を一切行わず完全自律で動作する。
+
+### 推奨 settings.json（モデル構成）
+
+run 本体（`/dev-workflow:run` を解釈しているセッション）は Epic 全体を通して動き続ける、
+**最も長寿命なコンテキスト**である。ここを最上位モデルで固定するとコストがウェーブ数に比例して
+膨らむ。推奨は「本体は sonnet、難所だけ advisor(opus) に上げる」構成である。
+
+```json
+{
+  "model": "sonnet",
+  "advisorModel": "opus",
+  "effortLevel": "xhigh",
+  "env": { "ENABLE_TOOL_SEARCH": "true" }
+}
+```
+
+| 設定 | 効果 |
+|---|---|
+| `model: sonnet` | オーケストレータ本体のトークン単価を下げる。ウェーブ数に比例するコストがここに集中している |
+| `advisorModel: opus` | 難しい判断のときだけ opus に問える。常時 opus とは違い、呼んだ回数分しか払わない |
+| `effortLevel: xhigh` | モデルを下げた分の推論深度を戻す。sonnet + xhigh は opus + high より安く、判断品質の劣化を抑えられる |
+| `ENABLE_TOOL_SEARCH` | ツール定義を遅延読み込みし、システムプロンプトの固定コストを下げる |
+
+- **generator（sonnet）のモデルはエージェント定義側で固定されており、この設定の影響を
+  受けない。** evaluatorは既定でsonnet（発見役）だが、確度判定役として起動する呼び出しだけ
+  `model: opus`を起動時に上書きする（Task #157。詳細は`docs/adr/0006-evaluator-model-split.md`）。
+  いずれもここで変わるのはオーケストレータ本体だけである
+- **これは推奨であって前提条件ではない。** 未設定でも run は動作する。run は起動時に現在の
+  構成を表示するだけで、停止はしない（「停止させるものと、記録して進めるもの」の原則）
+
+**LSP（任意。上記「LSP」節参照）を有効化する場合**は、同じ `settings.json` に
+`enabledPlugins` を追加する。`treflebonbon/dotfiles` の `private_dot_claude/settings.json.tmpl`
+で確認できた例:
+
+```json
+{
+  "model": "sonnet",
+  "advisorModel": "opus",
+  "effortLevel": "xhigh",
+  "env": { "ENABLE_TOOL_SEARCH": "true" },
+  "enabledPlugins": {
+    "typescript-lsp": true,
+    "gopls-lsp": true,
+    "rust-analyzer-lsp": true,
+    "lua-lsp": true
+  }
+}
+```
+
+未設定でも generator は `Grep` / `Read` で従来どおり動作する（前述「LSP」節の「未確認の注意点」参照）。
 
 ### パーミッション設定（必須）
 
@@ -571,6 +892,18 @@ YOLOモードではClaude Code本体のパーミッション確認を無効化�
 > `rm` 系コマンドはパイプや `&&` 経由でも個別にブロックされる。  
 > プロジェクトのビルド・テストコマンドは `allow` に追加してください。
 
+### 停止させるものと、記録して進めるもの
+
+自律ループを止めてよいのは、**続行すると成果物が壊れる**場合に限る。それ以外は記録して進む。
+
+| 種別 | 例 | 扱い |
+|---|---|---|
+| **停止** | リポジトリ衛生プリフライト exit 2 / サンドボックス `mode=none` / 循環依存 | run を開始しない・停止する |
+| **差し戻し** | レーン内ゲート失敗 / 統合ゲート失敗 / ベース逸脱・競合 | 取り込まず次ウェーブへ持ち越す（ループは止めない） |
+| **記録して進む** | `skips=unknown` / トークン数が読み取れない / 準備コマンドの `--warm` 失敗 / worktree 削除失敗 / Slack 通知失敗 | 事実を Epic issue と PR 本文に残し、そのまま次へ進む |
+
+「記録して進む」に分類したものを停止条件に格上げしない。これらは成果物の正しさを左右しない観測項目であり、ここで止めると人間が戻るまで run 全体が遊ぶ。**同時に、記録を省略して黙って進むことも禁止する**——`skips=unknown` を「0件」と読み替えないのはこの原則の帰結である。
+
 ### 自律動作ポリシー
 
 - ユーザーへの質問・確認は行わない
@@ -620,7 +953,9 @@ bash "${CLAUDE_PLUGIN_ROOT}/adapters/common/install-git-hooks.sh" --uninstall .
 
 ### 誤検知対策
 
-- **許可リスト:** lock ファイル、`__snapshots__`、`fixtures`/`testdata`、`node_modules`/`vendor`、`*.min.*`、`*.svg`、`*.generated.*`、gitignore 済みファイル等は自動で除外
+- **許可リスト:** lock ファイル、`__snapshots__`、`fixtures`/`testdata`、`node_modules`/`vendor`、`*.min.*`、`*.svg`、`*.generated.*`、**`generated/`・`__generated__/`（ディレクトリ名）**、gitignore 済みファイル等は自動で除外
+  - `generated/` 配下の除外は、`graphql-codegen` の client preset のように**1ファイルへ集約された生成物**（例: `frontend/src/generated/graphql.ts`）が極端に長い1行として出力され、ミニファイ/難読化コードと誤検知される問題への対処（#141）。ディレクトリ名は `generated` / `__generated__` に限定し、**`gen/` のような一般的すぎる短縮名は含めない**。「gen」は codegen 出力の慣用名でもあるが単なる一般語でもあり、これを許可すると「ディレクトリ名を gen にするだけで検査を回避できる」経路になってしまう。生成物かどうか確証が持てない場合は許可リストを狭く保ち、検査を効かせたままにする（安全側に倒す）
+  - この誤検知は `readability-guard:allow` コメントでは解消できない。生成物は再生成のたびに書き換わるためコメントが消え、「codegen再実行で差分が出ないこと」を完了条件に持つワークフローではその確認を必ず壊してしまう
 - **エスケープハッチ:** どうしてもエンコード済みデータが必要な場合、ファイル内に `readability-guard:allow <理由>` と書くと当該ファイルを除外。**人間可読な正当化をソースに残させる**ことで抑止の理念と整合させる
 
 ### 調整（環境変数）
@@ -685,15 +1020,19 @@ Dockerfile の挙動は従来どおり `dirname(Dockerfile)` のままで変わ�
 `DEV_WORKFLOW_DOCKER_BUILD_CONTEXT` を設定するとこの既定を上書きし、常にその値をビルド
 コンテキストとして使います（最優先）。
 
-### 分離単位（コンテナ = epic / キャッシュ = リポジトリ / イメージ = Dockerfileのhash）
+### 分離単位（コンテナ = epic / キャッシュ = リポジトリ + レーン名前空間 / イメージ = Dockerfileのhash）
 
 3つの資源はそれぞれ異なる単位で分離・共有されます。
 
 | 資源 | 分離・共有の単位 | 命名 |
 | --- | --- | --- |
 | コンテナ | **epic 単位** | `dw-sandbox-<repo>[-<epic>]` |
-| キャッシュ volume | **リポジトリ単位**（epic 間で共有） | `dw-cache-<repo>-<path>` |
+| キャッシュ volume | **リポジトリ単位**（epic 間で共有）。volume 自体は分割しないが、`DEV_WORKFLOW_LANE_SCOPED_CACHE_ENV` で宣言した環境変数だけ、同一volume内の**レーン別サブディレクトリ**に向けられる（既定は未宣言＝従来どおり共有。詳細は後述「レーンスコープ・キャッシュ」） | `dw-cache-<repo>-<path>` |
 | イメージ | **Dockerfile 内容の hash 単位** | `dev-sandbox:<repo>-<hash8>` |
+
+`--reset-cache` はキャッシュ volume を丸ごと削除するため、その作用範囲は常に**リポジトリ単位**
+（volume単位）である。レーン別サブディレクトリを使っていても、`--reset-cache` はそれらを含めて
+volume ごと一括で消す（サブディレクトリ単位で選択削除する手段は無い）。
 
 バインドマウントはリポジトリルートに固定しているため、generator の isolation worktree
 （`.claude/worktrees/agent-*`）や epic worktree がいくつ増えてもコンテナは epic あたり1個のままです。
@@ -701,6 +1040,42 @@ Dockerfile の挙動は従来どおり `dirname(Dockerfile)` のままで変わ�
 （40秒→17秒）の本体であり、epic 単位にすると新しい epic が毎回コールドスタートに戻ってしまうためです。
 非対称であることの唯一の実害は `--reset-cache` の誤爆（他 epic のキャッシュまで巻き込む）なので、
 そこだけを running コンテナ検出のガードで潰しています（後述）。
+
+#### 検証結果のスタンプ（呼び出しごとの固定オーバーヘッド削減。issue #145）
+
+dockerfile モードは1回の呼び出しで前置きの検証（イメージ存在・コンテナ存在・マウント元・
+イメージIDスキュー・running確認）に docker CLI が最大7回呼ばれ、Windows実測で約1.7秒かかります
+（Epicあたり数分の固定オーバーヘッド）。これを毎回やり直す代わりに、フル検証が成功した直後に
+「コンテナ名・解決イメージID・正規化済みマウント元」を**スタンプ**として
+`${DEV_WORKFLOW_STAMP_HOME:-${HOME}/.claude/dev-workflow/stamps}` 配下に残します。次回以降は
+この3点が現在の状態と一致し、かつコンテナが running のときだけ、前置き検証を「現在のイメージID
+再確認＋running確認」の2回に短縮し `docker exec` へ直行します（fast path）。
+
+**fail-safe**: スタンプが無い・読めない・3点のいずれかが不一致・`--rebuild` 指定時は、
+必ず従来どおりのフル検証に戻ります。`--down` / `--reset-cache` はコンテナ削除と同時にスタンプも
+無効化します。スタンプはリポジトリの追跡ファイルにせず `${HOME}` 配下に置くため、ハーネス非注入
+原則に適合します（Epic 専用 worktree と各レーンの isolation worktree の両方から共通に読めます）。
+`--print-plan` はスタンプの有無に関わらず docker に一切触れません（従来どおり）。
+compose モードは対象外です（詳細は `docs/adr/0002-sandbox-overhead-reduction.md`）。
+
+#### レーンスコープ・キャッシュ（並列レーンの資源競合の緩和。issue #145）
+
+キャッシュ volume はリポジトリ単位で共有するため、cargo registry・yarn v1 等
+**グローバルロックを取るキャッシュ**では並列レーンが直列化することがあります。volume 自体は
+分割せず、`DEV_WORKFLOW_LANE_SCOPED_CACHE_ENV` で宣言した環境変数だけを、同じ volume 内の
+レーン別サブディレクトリ（`<宣言パス>/lanes/<レーンスコープ>`）に向けます。
+
+```bash
+DEV_WORKFLOW_LANE_SCOPED_CACHE_ENV='CARGO_HOME=/root/.cargo/registry'
+```
+
+レーンスコープは呼び出し元 worktree から自動的に決まります: `.claude/worktrees/agent-*`
+（generator の isolation worktree）から呼ばれたら `agent-xxxx`、それ以外（リポジトリルート・
+epic worktree）は `shared` です。`shared` のときは env 上書きを行わず、従来どおり共有
+ディレクトリを使います。**既定は未宣言（空）で、現行と完全に同一の挙動です。** volume 名・
+`--reset-cache` / `--ls` / `--down` の作用範囲は変わりません（レーン別サブディレクトリも
+同じ volume 内にあるため `--reset-cache` で一緒に消えます）。設計判断の詳細は
+`docs/adr/0002-sandbox-overhead-reduction.md` を参照してください。
 
 ### サンドボックスへのコマンド投入
 
@@ -760,6 +1135,10 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic epic259 --print-plan
 2. 同一リポジトリの管理コンテナが**1つでも running なら中断**し、`--force` の指定を促します
    （他 epic が実行中にキャッシュを壊さないためのガード）。
 3. `--force` を指定した場合のみ、running なコンテナがあっても実行します。
+
+volume 自体は分割していないため、`DEV_WORKFLOW_LANE_SCOPED_CACHE_ENV` で作ったレーン別
+サブディレクトリ（`<パス>/lanes/<レーンスコープ>`）も同じ volume 内にあり、`--reset-cache` で
+まとめて削除されます（前述「レーンスコープ・キャッシュ」参照）。
 
 #### `--rebuild` の使いどころ
 
@@ -828,6 +1207,9 @@ volume 化は **dockerfile モード専用**であり、compose モードでは�
 呼ばれていません）。compose で同等のキャッシュを効かせるには、compose ファイル側で
 named volume を定義する必要があります。**`sandbox-exec.sh` は利用者の compose ファイルへ
 介入しません。** そのままコピーして使えるサンプルは以下のとおりです。
+`--print-plan` の出力も同じ理由で、compose/none モードでは `cache_volume=` 行を出しません
+（dockerfile モードでのみ出力します。issue #104。実際には接続されない設定を「これから
+使われる設定」として見せないようにするため）。
 
 ```yaml
 # docker-compose.dev.yml の例（app サービスにキャッシュ用 named volume を並べる）
@@ -895,6 +1277,10 @@ DEV_WORKFLOW_COMPOSE_WORKDIR=/workspace      # composeモードでのコンテ�
 READABILITY_STDIN_TIMEOUT=5                  # 可読性ガードが引数なし・非tty時にstdinを待つ上限秒数
 DEV_WORKFLOW_SANDBOX_EXEC=path/to/sandbox-exec.sh  # share-prepared-dirs.shが使うsandbox-exec.shのパス
                                                     # （既定: share-prepared-dirs.shと同じディレクトリ。テストでスタブに差し替える口）
+DEV_WORKFLOW_FEEDBACK_HOME=path              # フィードバック台帳の親ディレクトリ（既定: ~/.claude/dev-workflow/feedback）
+DEV_WORKFLOW_FEEDBACK_DIR=path               # 台帳ディレクトリを直接上書きする（テスト用）
+DEV_WORKFLOW_FEEDBACK_THRESHOLD=3            # 反映・還流を提案するまでの再現回数（昇格閾値）
+DEV_WORKFLOW_UPSTREAM_REPO=owner/repo        # 還流先（既定: プラグインのマニフェストの repository）
 ```
 
 ## Slack通知
@@ -1048,6 +1434,69 @@ DEV_WORKFLOW_WATCHDOG_ESCALATE_SEC=1800  # エスカレーション再通知間�
 DEV_WORKFLOW_NO_SLEEP_INHIBIT=1          # スリープ抑止を完全に無効化する
 ```
 
+## フィードバックループ
+
+`/dev-workflow:feedback` は、ハーネスが残した実行ログを読んで**次の実行が今回より良くなる差分**を取り出すスキル。任意のタイミングで手動起動する（フックによる自動起動はしない）。
+
+### 何を見るか
+
+`scripts/collect-feedback-signals.sh` が探索と一次集計を担い、スキル側には「読むべきファイルと数字」だけを渡す。**探索を自然言語の指示に任せると毎回違う場所を見て違う結論が出る**ため、見る対象を固定している。
+
+| 対象 | 何が分かるか |
+|---|---|
+| `.claude/.dev-workflow-run-state` | 中断した run の epic / wave / 経過時間 |
+| `.claude/.dev-workflow-heartbeat` | 最終の生存信号 |
+| `.claude/.dev-workflow-watchdog.log` | stall / escalate / abort の回数 |
+| `.claude/agent-tokens.tsv` | role 別トークン消費（コスト劣化の一次証拠） |
+| `~/.claude/projects/<slug>/*.jsonl` | セッション transcript（訂正・やり直し・中断の実物） |
+
+transcript の中身はスクリプトでは読まない（会話本文の解釈は `grep` で拾える性質のものではない）。**パスと更新時刻と行数だけを返し、読むのは分析側の仕事**とする。列挙は上限で打ち切られたら `transcripts.truncated=1` を出す。**黙って打ち切って「全部見た」と読める出力を作らない。**
+
+### 昇格閾値
+
+観測は即座に反映しない。`scripts/feedback-ledger.sh` の台帳に記録し、**同じキーが閾値回数（既定3回）再現して初めて**反映・還流を提案する。
+
+```bash
+bash scripts/feedback-ledger.sh list          # 観測の一覧
+bash scripts/feedback-ledger.sh ready         # 閾値に達したキー
+bash scripts/feedback-ledger.sh path          # 台帳の置き場所
+```
+
+1回きりの事故で恒久ルールを書いたり issue を立てたりすると、**誤検知がそのまま定着する**。閾値は `DEV_WORKFLOW_FEEDBACK_THRESHOLD` で変更できる。
+
+台帳は `~/.claude/dev-workflow/feedback/<repo>/` に置く。サンドボックス定義の規約パスと同じ流儀で、**駆動先の業務リポジトリには一切書き込まない**（上記「ハーネス非注入原則」）。
+
+### 修正範囲の限定
+
+**レビューと修正の対象は、実行中のプロジェクト固有の範囲に限定される。**
+
+| 対象 | 可否 |
+|---|---|
+| 台帳配下（`learnings.md` 等） | 常に可 |
+| プロジェクトの `CLAUDE.md` / `.claude/settings.local.json` / ドキュメント | **ユーザーが個別に承認した場合のみ** |
+| 駆動先の `.gitignore` | 不可 |
+| プラグイン本体（`${CLAUDE_PLUGIN_ROOT}` 配下） | 不可。**還流させる** |
+
+プラグインを利用者環境で書き換えると、更新で失われるうえ他の利用者にも届かない。だからハーネス起因の問題はその場で直さず、配布元へ戻す。
+
+唯一の例外は、駆動先が dev-workflow リポジトリ自身のとき（`repo.is_dev_workflow=1`）。このときプラグイン本体＝プロジェクトのソースなので通常の修正対象として扱い、還流は行わない。
+
+### 配布先からの還流
+
+`scope=harness` かつ閾値に達したキーは、redact 済みの issue 本文に組み立てられる。
+
+```bash
+bash scripts/feedback-ledger.sh upstream-repo            # 還流先の owner/repo
+bash scripts/feedback-ledger.sh render-upstream --key <slug>   # 本文（redact済み）
+```
+
+- 還流先は**プラグインのマニフェストの `repository` から引く**ため、fork して配布された環境ではその fork が還流先になる。社内ミラーへ送りたい場合は `DEV_WORKFLOW_UPSTREAM_REPO=owner/repo` を設定する
+- 機械的 redact（HOME・ユーザー名・リポジトリ名・メールアドレス・GitHub / Slack / API のトークン様文字列・Windows と POSIX のホームパス）は**最後の網であって唯一の防御線ではない**。社名・未公開仕様・コード片が残っていないかは人間が確認する
+- **本文全文をユーザーに提示し、承認を得てからでなければ投稿しない。** `gh` 未認証や不承認のときは本文を台帳配下へ保存し、投稿しなかったことを成功と報告しない
+- 同じキーの issue が既にある場合は新規作成せず既存 issue へコメントする（本文にキーが埋まっているので `gh issue list --search` で拾える）
+
+還流した issue は `/dev-workflow:plan` → `/dev-workflow:run` で処理される。**ハーネスの改善をハーネス自身で回すのがこのループの外周**にあたる。
+
 ## プロジェクト固有のカスタマイズ
 
 エージェントはプロジェクトの `CLAUDE.md` と `.claude/rules/` を自動的に読み込みます。  
@@ -1091,8 +1540,9 @@ DEV_WORKFLOW_TEST_CMD='<プロジェクトの全テストコマンド>' \
 
 `DEV_WORKFLOW_TEST_CMD` は**必須**です（例: `DEV_WORKFLOW_TEST_CMD='bash tests/run-tests.sh'`）。
 未設定だと `run-loop.sh` は起動直後に `exit 1` します。既定値を置いていないのは、対象テストの選定を
-generator に委ねると一部しか実行されず回帰を見逃すため（#37 の再発防止）で、統合ゲートは常に
-このコマンドでプロジェクトの全テストを実行します。
+generator に委ねると一部しか実行されず回帰を見逃すため（#37 の再発防止）で、**Epic 統合ゲート**
+（全タスク完了後にEpicにつき1回）は常にこのコマンドでプロジェクトの全テストを実行します
+（#144。ウェーブ＝タスクごとには実行しません）。
 
 `DEV_WORKFLOW_DRY_RUN=1` を付けると実行内容の確認だけができますが、
 `DEV_WORKFLOW_TEST_CMD` の必須チェックは DRY_RUN より前に走るため、DRY_RUN で確認する場合も
@@ -1110,6 +1560,7 @@ generator に委ねると一部しか実行されず回帰を見逃すため（#
 | 「入力待ち」Slack通知 | `Notification` フック | **なし**（Codexに該当イベントがない） |
 | `watchdog.sh --abort` のブロック | `PreToolUse`が`exit 2`でハードブロック（ツール呼び出しは確実に拒否される） | **ソフトな打ち切り依頼のみ。**`PreToolUse`は`systemMessage`のみ対応で`continue`は読まれないため、ツール呼び出し自体は実行される。確実に止めるにはセッション（`codex exec`／`run-loop.sh`）を人間が中断する |
 | 準備成果ディレクトリの共有（`## 共有ディレクトリ` 節） | 対応（`scripts/share-prepared-dirs.sh`） | **なし。** generator を Epic 専用 worktree 上で直接動かすためレーン worktree が存在せず、そもそも問題が発生しない |
+| サブエージェント単位の起動時モデル上書き（evaluatorの発見役/確度判定役） | 対応（Task/Agent起動時に`model: sonnet/opus/haiku/fable`を指定可能。evaluator定義自体は変えず、確度判定呼び出しだけ`model: opus`を上書き） | **未確認。** 同等機構の有無を実測していないため、Codex側は単一evaluator・モデルは親セッション継承のまま据え置き（`docs/adr/0006-evaluator-model-split.md`参照） |
 
 ## このプラグイン自体を開発する場合
 
@@ -1133,6 +1584,30 @@ bash adapters/codex/build.sh --check
 ```
 
 **`core/` を編集したら両方を再生成し、生成物をコミットに含めてください。**
+
+### run スキルの分割（progressive disclosure）
+
+`skills/run/SKILL.md` は run を回すあいだ**ずっとコンテキストに載り続ける**。ウェーブごとに
+再解釈されるため、ここに置いた1行はウェーブ数だけ推論コストを払う。そこで本体には
+「毎回通る手順」だけを置き、**その状況になったときだけ読むもの**を
+`skills/run/references/` へ分けている。
+
+| ファイル | 読むタイミング |
+|---|---|
+| `references/recovery.md` | レーン内ゲート・統合ゲート・マージが失敗したとき |
+| `references/troubleshooting.md` | run がハングし、人間が打ち切り／再開を判断するとき |
+| `references/progress-display.md` | バナー・レーン結果・PR 本文の集計を組み立てるとき |
+| `references/sandbox.md` | Epic 本文の任意節の書き方、compose の要求仕様を確認するとき |
+| `references/cleanup.md` | worktree の後片付け手順が要るとき |
+| `references/review.md` | 一括レビューが `REQUEST_CHANGES` を返した／変更が50ファイルを超えたとき |
+
+**新しい手順を足すときは、まず「毎ウェーブ通るか」を問うこと。** 通らないなら
+`references/` に置き、本体からは1行のリンクで参照する。判断の根拠・背景・失敗事例の説明は
+本体に書かない（本体に必要なのは結論だけである）。
+
+テストは本体と `references/` を連結した平坦化ビュー（`tests/run-tests.sh` の
+`RUN_SKILL_FLAT`）に対して「記述があるか」を検査する。**本体内の記述の順序**を問うテストだけが
+`skills/run/SKILL.md` そのものを見る。
 
 設計方針は [docs/dev-workflow-multi-vendor-guide.md](docs/dev-workflow-multi-vendor-guide.md) を参照してください。
 
