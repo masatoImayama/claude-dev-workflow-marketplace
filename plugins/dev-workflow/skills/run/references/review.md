@@ -14,7 +14,13 @@ R1 は `correctness` / `readability` / `over-engineering` / `security` の4観�
 1. **findings の連結**: 4本の `findings[]` をそのまま連結する
 2. **重複排除**: 同一 `location`（ファイル:行）かつ同一趣旨の指摘は1件に統合する。
    統合時は**最も高い severity** を採用し、由来した観点名（`findings[].focus`）を
-   `detail` または備考に併記する（例:「correctness / security の両観点から指摘」）
+   `detail` または備考に併記する（例:「correctness / security の両観点から指摘」）。
+   **迷ったら統合しない。** 統合漏れは二重 issue が立つだけだが、誤統合は severity の低い側の
+   指摘を本文ごと失う。
+   - **Jev（任意依存）が使える場合**は、`location` でグループ化したあと、同一グループ内の
+     ペアだけを `Noul`「この2件は同じ指摘か」に投げて判定を委ねてよい（しきい値・記録の
+     作法は `core/references/jev-assist.md`「① 指摘の重複排除」が正本）。
+     **未導入・呼び出し失敗なら従来どおりあなたが判断する。**ここで止まらない
 3. **verdict の合成**: 4本のうち1本でも `REQUEST_CHANGES` なら全体を `REQUEST_CHANGES`
    とする。4本すべてが `APPROVE` の場合のみ全体を `APPROVE` とする
 4. **`reviewed_commit` の食い違い**: 4本とも同じ値になるはずだが、食い違った場合は
@@ -23,8 +29,73 @@ R1 は `correctness` / `readability` / `over-engineering` / `security` の4観�
 5. **1本の失敗**: 4本のうち1本でも起動失敗・応答不能で結果が得られなかった場合、
    **その観点が未レビューである事実を Epic issue と PR 本文に記録**して先へ進む
    （「記録して進む」に分類する。run は止めない）。残り3本の結果でマージ・判定は続行する
+6. **マージ前の findings と、マージの判断を Epic issue に残す**（#263）。下記「マージ前の
+   findings を残す」に従う。**マージ後の結果（review issue）だけでは、統合漏れを誰も
+   検証できない。**
 
 マージ後の `findings[]` は、次の「確度判定」を経てから R2（issue化）へ進む。
+
+### マージ前の findings を残す（#263）
+
+R2 が作る review issue は**マージ後**の結果であり、PR 本文の「軽微な指摘」も同様である。
+**マージ前の4本の findings を残さないと、「同一 `location` の2件を統合した / しなかった」
+という判断の入力そのものが消え、統合漏れ（本来1件にすべきものを2件のまま issue 化した事故）
+を後から数えられない。** ハーネスの中核は「状態は GitHub issue と git に置く」であり、
+R1 の出力だけがこの原則の外にあった。
+
+**step 2〜4 を終えた時点で、4本の生の findings と、下した判断をまとめて1コメントにする**
+（判断の内容は step 2 を終えないと書けない。生の findings は4本の応答に残っているので、
+順序を入れ替える必要はない）。**ただし R2（issue化）より前に必ず記録する** — issue を
+立ててから記録しようとすると、R2 で失敗・中断したときに判断の入力が失われる。
+
+```bash
+gh issue comment "$ARGUMENTS" --body "$(cat <<'BODY'
+## R1 マージ前の findings（観点別・重複排除の前）
+
+<!-- 観点ごとに、返ってきた JSON ブロックの findings[] をそのまま貼る。
+     1本が失敗した観点は「起動失敗・未レビュー」と書く（step 5 の記録と重複してよい）。 -->
+
+### correctness（N件 / verdict: ...）
+[findings[] をそのまま]
+
+### readability（N件 / verdict: ...）
+[同上]
+
+### over-engineering（N件 / verdict: ...）
+[同上]
+
+### security（N件 / verdict: ...）
+[同上]
+
+## 重複排除の判断
+
+<!-- 同一 location でグループ化した結果、どのペアをどう扱ったかを1行ずつ。
+     統合しなかったペアも必ず書く（これが統合漏れを検証する唯一の材料になる）。 -->
+- `パス:行` — correctness と security の2件を**統合**（severity は high を採用）
+- `パス:行` — readability と over-engineering の2件は**別件として維持**（趣旨が異なる）
+
+## reviewed_commit
+- 4本の値: ...（食い違った場合は採用した値と、食い違った事実を明記する。step 4）
+BODY
+)"
+```
+
+**長さの扱い**: findings が多い Epic ではコメントが長大になる。次の順で縮める。
+
+1. 各 finding の `detail` / `fix` を**先頭 500 文字で打ち切る**（打ち切った事実を
+   `…（以下省略）` のように示す。`title` / `location` / `severity` / `focus` は省略しない）
+2. それでも1コメントに収まらない場合は、**観点ごとに別コメントへ分割する**
+   （1コメントに詰め込むために件数を間引いてはならない。**件数を落とすと統合漏れの検証が
+   できなくなり、この記録の目的が失われる**）
+
+**失敗したときの扱い**: `gh issue comment` が失敗しても **run は止めない。**
+「記録して進む」に分類し、記録できなかった事実を PR 本文に1行残して先へ進む
+（`core/instructions.md`「停止させるものと、記録して進めるもの」）。
+**記録の失敗を理由にレビュー自体を中断してはならない。**
+
+**Codex 版（`skills-codex/dev-workflow-run/SKILL.md`）には対応する手順を置かない。**
+Codex 版の R1 は evaluator 1本で動き（観点別4本の並列起動を行わない）、マージ工程そのものが
+存在しないため、「マージ前」の findings という概念が無い。意図的な差分であり、乖離ではない。
 
 ### 確度判定（R1 と R2 の間。Task #157）
 
@@ -37,6 +108,12 @@ R1（発見役・sonnet・観点別4本並列）はスピード優先のため�
 対象は「R1の結果マージ」後の `findings[]` のうち **high / medium のみ**（low はもともと
 issue化しないため確度判定は不要。共通ルールの「レビュー基準」の3段階は変更しない）。
 high/medium が1件も無ければこのステップ自体を省略し、そのままR2（0件のissue化）へ進む。
+
+**このステップを機械的に省略する経路は無い。** Jev（任意依存）による前段トリアージ
+（「明白に成立する指摘だけ opus を省いて素通しさせる」）を検討したが、**shadow 計測で
+削減効果が 0% だったため結線しなかった**（158件中、素通ししきい値に達した指摘が0件。
+Jev はコードを読めないため「確実に成立する」と断言できず、高い確率を返さない）。
+経緯は `docs/adr/0012-jev-system-one-decision-points.md`「決定C」を参照。
 
 **この呼び出しは、プロンプト本文の指示ではなく Task/Agent ツールの起動時パラメータで
 モデルを上書きして起動する。** ADR-0006 が確認したとおり、Claude Code の Task/Agent 起動には
@@ -56,6 +133,9 @@ Epic #$ARGUMENTS のレビュー指摘の確度を判定してください。
 - 対象: 以下はR1マージ後のfindings（high/mediumのみ）
 [マージ済みfindingsのJSON配列をそのまま貼る]
 - 差分範囲: main...[epic/epicXX/機能名]
+- 応答言語: [RESOLVED_LANG]（`findings[].title` / `detail` / `fix` など issue 本文になる
+  人間向けテキストはこの言語で書くこと。`verdict` / `severity` / `focus` / `confidence` /
+  `lang` の値は英語 enum のまま返すこと）
 - 各findingについて実際にコードを確認し、confidence（high-confidence / low-confidence）を判定すること
 - 新しい指摘を追加しないこと（発見はR1が完了済み。ここでの役割は確度判定のみ）
 - 最後に必ずJSONブロック（各findingに`confidence`フィールドを追加したfindings配列。
@@ -76,6 +156,17 @@ issue化せず記録のみ）へ格下げして記録する。** 既存の low s
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/record-agent-tokens.sh" record \
   --epic "$EPIC_NUM" --role evaluator --mode confidence-check \
   --note "model=[JSONのmodelフィールド。読み取れなければ'unknown']" --tokens [読み取ったトークン数]
+```
+
+**モデル上書きの空振り検知と同じ位置で、応答言語の空振り検知（Epic #246 D1 / #255）も
+扱う。** 確度判定役が返した判定JSONのトップレベル `lang` を `RESOLVED_LANG` と照合する。
+値の妥当性判定は条件分岐を自前で書かず `bash "${CLAUDE_PLUGIN_ROOT}/scripts/resolve-lang.sh"
+--lang "[返ってきた値]"` の出力で行う（R1と同じ。許容リストの二重管理を避ける）。食い違い・
+欠落（`lang`を返さない旧形式のJSONも含む）があれば、その事実を1件のコメントとして Epic
+issue に記録し、そのまま先へ進む（「記録して進む」に分類。run は止めない）:
+
+```bash
+gh issue comment "$ARGUMENTS" --body "応答言語の空振り検知（confidence-check）: 返ってきたlang=[値。欠落はunknown]が解決値${RESOLVED_LANG}と食い違っています"
 ```
 
 **起動時モデル上書きが技術的に実現できなかった場合（`model`パラメータ自体が使えない等）**は、
@@ -109,6 +200,9 @@ gh issue create --label "task,review" --title "Review: [title]" --body "$(cat <<
 ## 該当箇所
 `[location]`
 
+## 対象ファイル
+- [locationのファイルパス部分（`:行番号`を除いたもの）。修正が他のファイルにも及ぶ場合はfixの内容も踏まえて追加する]
+
 ## 修正方針
 [fix]
 
@@ -130,7 +224,13 @@ BODY
 
 `- Epic: #[epic番号]` と `- 前提: なし` は必ず書く。`scripts/plan-waves.sh` がこの2行を
 読んで他Epicのタスクを除外し、review issueを通常のウェーブへ載せられるようにするため
-（R3参照）。
+（R3参照）。**指摘同士に実際の依存がある場合**（例: 同じ箇所を直す2件で順序が要る場合）は、
+依存する側のissueで `- 前提: なし` を `- 前提: #N`（先に対応すべきissue番号）へ書き換えること。
+
+`## 対象ファイル` も必ず書く（#232）。`scripts/plan-waves.sh` は「## 対象ファイル」節が
+無いissueを宣言漏れとみなし、対象ファイルを宣言している他issueと同一サブバッチへ同居させない
+（安全側に倒す）ため、節が無いとR3の指摘対応ループの並列度が落ちる。`location`（`パス:行`形式）
+からファイルパス部分を取り出して列挙する。
 
 `reviewed_commit` は次の delta-review の起点になるので、**必ず控えておく。**
 
@@ -173,6 +273,9 @@ evaluator側の対応する確認観点は `core/references/review-checklist-cor
 Epic #$ARGUMENTS の指摘対応を確認してください。
 - モード: delta-review
 - 差分範囲: [R1のreviewed_commit]..[epic/epicXX/機能名]
+- 応答言語: [RESOLVED_LANG]（`findings[].title` / `detail` / `fix` など issue 本文になる
+  人間向けテキストはこの言語で書くこと。`verdict` / `severity` / `focus` / `lang` の値は
+  英語 enum のまま返すこと）
 - 指定範囲外の蒸し返しはしないこと
 - 最後に必ずJSONブロックを出力すること
 ```
@@ -182,6 +285,16 @@ R1と同じ作法でこのdelta-review呼び出しのトークン消費も記録
 ```bash
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/record-agent-tokens.sh" record \
   --epic "$EPIC_NUM" --role evaluator --mode delta-review --tokens [読み取ったトークン数]
+```
+
+**応答言語の空振り検知（Epic #246 D1 / #255）も同じ位置で行う。** 返ってきた判定JSONの
+トップレベル `lang` を `RESOLVED_LANG` と照合する。値の妥当性判定は条件分岐を自前で書かず
+`bash "${CLAUDE_PLUGIN_ROOT}/scripts/resolve-lang.sh" --lang "[返ってきた値]"` の出力で行う。
+食い違い・欠落（`lang`を返さない旧形式のJSONも含む）があれば1件のコメントとして Epic
+issue に記録し、そのまま先へ進む（「記録して進む」に分類。run は止めない）:
+
+```bash
+gh issue comment "$ARGUMENTS" --body "応答言語の空振り検知（delta-review）: 返ってきたlang=[値。欠落はunknown]が解決値${RESOLVED_LANG}と食い違っています"
 ```
 
 3. `APPROVE` → PR作成へ / `REQUEST_CHANGES` → R2 に戻る
@@ -249,10 +362,14 @@ Epic #$ARGUMENTS の全変更をレビューしてください。
 - モード: epic-review
 - 観点: correctness
 - 差分範囲: main...[epic/epicXX/機能名]
+- 応答言語: [RESOLVED_LANG]（`findings[].title` / `detail` / `fix` など issue 本文になる
+  人間向けテキストはこの言語で書くこと。`verdict` / `severity` / `focus` / `lang` の値は
+  英語 enum のまま返すこと）
 - 変更ファイル数が50超のため、code-review-graphのblast radiusの算出を使って読む優先順位を付けてよい
 - 最後に必ずJSONブロック（verdict / reviewed_commit / focus / findings）を出力すること
 
-（readability / over-engineering / security も同様に3本続けて同一メッセージで起動する）
+（readability / over-engineering / security も同様に3本続けて同一メッセージで起動する。
+  応答言語も同じ値を渡す）
 ```
 
 code-review-graphが未導入の場合（従来どおりPhase単位に分割する既存の回避策。Phaseごとに
@@ -263,7 +380,11 @@ code-review-graphが未導入の場合（従来どおりPhase単位に分割す�
 Epic #$ARGUMENTS のうち Phase 1 の変更をレビューしてください。
 - 観点: correctness
 - 差分範囲: main...[epic-branch] のうち [Phase1で変更されたファイル群]
+- 応答言語: [RESOLVED_LANG]（`findings[].title` / `detail` / `fix` など issue 本文になる
+  人間向けテキストはこの言語で書くこと。`verdict` / `severity` / `focus` / `lang` の値は
+  英語 enum のまま返すこと）
 
-（readability / over-engineering / security も同様。Phase 2 以降も同じ形で続ける）
+（readability / over-engineering / security も同様。Phase 2 以降も同じ形で続ける。
+  応答言語も同じ値を渡す）
 ```
 

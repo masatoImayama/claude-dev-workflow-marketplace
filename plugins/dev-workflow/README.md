@@ -70,7 +70,7 @@ claude --plugin-dir /path/to/dev-workflow
 
 ## 任意依存の外部ツール
 
-dev-workflow は複数の外部ツール（context7 / code-review-graph / LSP）を**任意依存**として利用します。
+dev-workflow は複数の外部ツール（context7 / code-review-graph / LSP / Jev）を**任意依存**として利用します。
 **必須依存ではありません。入れなくても dev-workflow は従来どおり動作します。**
 
 | ツール | 結線先 | 未導入時の挙動 |
@@ -78,11 +78,18 @@ dev-workflow は複数の外部ツール（context7 / code-review-graph / LSP）
 | [context7](https://github.com/upstash/context7)（MIT） | generator のみ | generator はライブラリ API を context7 で確認しません。推測に頼らず、既存利用箇所・公式ドキュメントで確認する従来どおりの手順になります |
 | [code-review-graph](https://github.com/tirth8205/code-review-graph)（MIT） | evaluator のみ（大規模差分のみ） | evaluator は blast radius（影響範囲）を使った優先順位付けをしません。従来どおり Phase 単位に分割してレビューする手順になります |
 | LSP（typescript-lsp / lua-lsp / gopls-lsp / rust-analyzer-lsp 等） | generator のみ（Claude Code のみ。下記参照） | generator は定義・参照の追跡を `Grep` の総当たり＋`Read` で行います（従来どおり） |
+| [Jev](https://docs.typesafe.ai/)（TypeSafe AI の System One Model。hosted・有料） | run の指摘の重複排除 / feedback 台帳の分類 | 指摘の重複排除・台帳の分類を実行者自身が判断します（従来どおり）。MCP サーバーではなく HTTP API なので、鍵（`JEV_API_KEY`）が無ければ未導入扱いです |
 
 **いずれもワークフローを止めません。** テスト・レビューはツールの有無に関わらず従来どおり完走します。
 
 - **入れ方**: 導入手順・結線方式の実測結果・MCPツール名は [`docs/optional-mcp-tools.md`](docs/optional-mcp-tools.md) が正本です（README では二重管理しません）
 - **効かなければ外す判断基準**: `docs/optional-mcp-tools.md` の「外す判断基準」節を参照してください。複数 Epic を通してトークン消費が減らず、レビュー品質の向上も観測できない場合は結線を外してかまいません
+
+### トラブルシューティング
+
+| 症状 | 原因・対処 |
+|---|---|
+| `/plugin` に `Failed to reconnect to plugin:dev-workflow:context7: CONNECTION_CLOSED` 等と出る | 任意ツール（context7 / code-review-graph）が未導入なだけの正常な挙動です（異常ではありません）。解消したい場合は `/dev-workflow:setup` または `bash scripts/doctor.sh` を実行してください。詳細は [`docs/optional-mcp-tools.md`](docs/optional-mcp-tools.md) の「`/plugin` に `CONNECTION_CLOSED` と出る場合」参照 |
 
 ### LSP（探索ターン数の削減。Claude Code のみ。issue #154）
 
@@ -188,6 +195,15 @@ services:
 /dev-workflow:spec notifications
 /dev-workflow:epic notifications
 ```
+
+### 環境セットアップ
+
+```
+/dev-workflow:setup
+```
+→ 新しいマシン・新しい駆動先リポジトリでの立ち上げに使う。診断（`scripts/doctor.sh`）→
+案内 → （明示的な同意があれば）任意MCPの導入・サンドボックス雛形の生成 → 再診断、の順に進める。
+**`/dev-workflow:run` の前提ではない**。setup を実行していなくても run は従来どおり動く。
 
 ### フィードバック
 
@@ -1281,6 +1297,7 @@ DEV_WORKFLOW_FEEDBACK_HOME=path              # フィードバック台帳の親
 DEV_WORKFLOW_FEEDBACK_DIR=path               # 台帳ディレクトリを直接上書きする（テスト用）
 DEV_WORKFLOW_FEEDBACK_THRESHOLD=3            # 反映・還流を提案するまでの再現回数（昇格閾値）
 DEV_WORKFLOW_UPSTREAM_REPO=owner/repo        # 還流先（既定: プラグインのマニフェストの repository）
+DEV_WORKFLOW_LANG=ja                         # 人間向け出力の言語（ja|en。未設定・空・不正値なら ja）
 ```
 
 ## Slack通知
@@ -1496,6 +1513,43 @@ bash scripts/feedback-ledger.sh render-upstream --key <slug>   # 本文（redact
 - 同じキーの issue が既にある場合は新規作成せず既存 issue へコメントする（本文にキーが埋まっているので `gh issue list --search` で拾える）
 
 還流した issue は `/dev-workflow:plan` → `/dev-workflow:run` で処理される。**ハーネスの改善をハーネス自身で回すのがこのループの外周**にあたる。
+
+## 応答言語
+
+**人間向け出力の言語は `DEV_WORKFLOW_LANG` で切り替える。** 既定は `ja`。未設定なら
+従来どおり日本語で応答します。
+
+```bash
+export DEV_WORKFLOW_LANG=en   # ja|en。未設定・空・不正値なら ja
+```
+
+**対象**: planner のヒアリング・確認・提案、仕様書・計画書、Epic / Task issue の本文、
+generator の進捗報告・完了報告・issue コメント、evaluator の人間向けサマリーと
+`findings[].title` / `detail` / `fix`、run の進捗表示・PR 本文・Epic issue へのコメント、
+feedback の `learnings.md`・還流 issue 本文。
+
+**対象外**: 機械可読 JSON のキー名・enum 値、ラベル名（`epic` / `task` / `review`）、
+コミットメッセージの種別（`feat` / `fix` 等）、Epic / Task 本文の節見出し
+（`## 対象ファイル` / `## 準備コマンド` / `## 共有ディレクトリ` / `## SKIPパターン` /
+`## 編集時チェック`）、`- 前提:` / `- Epic:` / `- 想定時間:` の行頭キー、
+ブランチ命名規則、`readability-guard:allow` マーカー。これらは `plan-waves.sh` や
+`run` が文字列一致・ラベル検索でパースするため、翻訳すると依存グラフやウェーブ編成が
+黙って壊れます。対象・対象外の完全な表は `core/instructions.md` の「応答言語」節が
+**正本**です。
+
+**`DEV_WORKFLOW_LANG` はエージェントの応答にのみ効きます。** `check-readability.sh` /
+`edit-check.sh` / `notify-slack.sh` / `watchdog.sh` / `doctor.sh` /
+`check-prerequisites.sh` / 各 `build.sh` のような **bash スクリプトが出すメッセージは
+対象外**です（第1版の意識的な制約。日本語ハードコードのまま変更しません。対象に含める
+なら別 Epic）。
+
+不正値・未サポート値・空文字は `ja` に倒し、その事実を記録します（停止しません）。
+解決された値は `bash scripts/doctor.sh` の表示で確認できます。
+
+**既存の Epic / Task issue への追記にも、既存言語に合わせる例外は置かず常に設定値に
+従います。** `DEV_WORKFLOW_LANG=en` に切り替えたあとは、日本語で立っている既存 issue への
+コメントも英語で書きます。そのため同一 issue 内で日英が混在することがありますが、
+規則を単純に保ち実装とテストを明快にするための意識的なトレードオフです。
 
 ## プロジェクト固有のカスタマイズ
 

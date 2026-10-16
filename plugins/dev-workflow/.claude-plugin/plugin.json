@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "dev-workflow",
   "displayName": "Dev Workflow",
-  "version": "0.18.1",
+  "version": "0.20.0",
   "description": "3エージェント自律開発ワークフロー。Docker sandbox内でplanner・generator・evaluatorによる仕様策定から自律実装まで。",
   "author": {
     "name": "masatoImayama",
@@ -10,7 +10,7 @@
   },
   "repository": "https://github.com/masatoImayama/dev-workflow",
   "license": "MIT",
-  "keywords": ["workflow", "agents", "autonomous", "github-issues", "tdd", "docker", "sandbox"],
+  "keywords": ["workflow", "agents", "autonomous", "github-issues", "tdd", "docker", "sandbox", "setup"],
   "userConfig": {
     "default_generator_model": {
       "type": "string",
